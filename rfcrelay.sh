@@ -125,10 +125,14 @@ info "注入 root 密碼 + 啟用 SSH 密碼登入（loop mount）..."
 LOOP=""
 TMP_MNT=""
 cleanup_mount() {
-    [[ -n "$TMP_MNT" ]] && umount "$TMP_MNT/proc" "$TMP_MNT/sys" "$TMP_MNT/dev" 2>/dev/null || true
-    [[ -n "$TMP_MNT" ]] && umount "$TMP_MNT" 2>/dev/null || true
-    [[ -n "$TMP_MNT" ]] && rmdir  "$TMP_MNT"  2>/dev/null || true
-    [[ -n "$LOOP"    ]] && losetup -d "$LOOP"  2>/dev/null || true
+    [[ -n "$TMP_MNT" ]] || return
+    umount "$TMP_MNT/dev/pts" 2>/dev/null || true
+    umount "$TMP_MNT/dev"     2>/dev/null || true
+    umount "$TMP_MNT/sys"     2>/dev/null || true
+    umount "$TMP_MNT/proc"    2>/dev/null || true
+    umount "$TMP_MNT"         2>/dev/null || umount -l "$TMP_MNT" 2>/dev/null || true
+    rmdir  "$TMP_MNT"         2>/dev/null || true
+    [[ -n "$LOOP" ]] && losetup -d "$LOOP" 2>/dev/null || true
 }
 trap cleanup_mount EXIT INT TERM
 
