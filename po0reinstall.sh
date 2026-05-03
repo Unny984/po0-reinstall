@@ -224,23 +224,7 @@ echo "==> DD 開始..."
 xzcat /tmp/image.xz | dd of=\$TARGET_DISK bs=4M 2>&1
 sync
 echo ""
-
-# ── DD 後自動擴容（cloud image 分區通常只有 2-3G）──
-echo "==> 擴容分區到磁碟最大..."
-# 找到第一個分區號
-PART_NUM=\$(ls \${TARGET_DISK}* 2>/dev/null | grep -oE '[0-9]+$' | head -1)
-if [ -n "\$PART_NUM" ]; then
-    growpart \$TARGET_DISK \$PART_NUM 2>&1 && echo "==> growpart 完成" || echo "==> growpart 失敗（跳過）"
-    PART_DEV="\${TARGET_DISK}\${PART_NUM}"
-    # nvme 格式是 p1
-    [ -b "\$PART_DEV" ] || PART_DEV="\${TARGET_DISK}p\${PART_NUM}"
-    resize2fs \$PART_DEV 2>&1 && echo "==> resize2fs 完成" || echo "==> resize2fs 失敗（跳過）"
-else
-    echo "==> 找不到分區號，跳過擴容"
-fi
-sync
-
-echo "==> 完成！5 秒後重啟..."
+echo "==> DD 完成！5 秒後重啟..."
 sleep 5
 reboot -f
 INIT_HEREDOC
