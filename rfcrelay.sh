@@ -105,6 +105,9 @@ else
         # [FIX2] 兩步做，禁止 qemu-img | xz 管道（會產生 32 bytes 空檔）
         qemu-img convert -p -f qcow2 -O raw "$IMG_PATH" "$RAW_PATH" \
             || die "qemu-img convert 失敗（磁碟空間不足？請確認 /root 有 5GB+ 可用）"
+        # 轉完立刻刪 qcow2，節省空間
+        rm -f "$IMG_PATH"
+        info "  qcow2 已刪除，節省空間"
     elif [[ "$FORMAT" == "raw" ]]; then
         info "已是 raw 格式，複製..."
         cp "$IMG_PATH" "$RAW_PATH"
@@ -115,9 +118,19 @@ fi
 success "raw 轉換完成 ($(du -sh "$RAW_PATH" | cut -f1))"
 
 # ─── loop mount：預設 root 密碼 + SSH ───────────────────────────────────────
-# [FIX4] 改用 losetup 直接掛載，不依賴 virt-customize/supermin
 info "注入 root 密碼 + 啟用 SSH 密碼登入（loop mount）..."
 LOOP=$(losetup -f --show -P "$RAW_PATH") || die "losetup 失敗"
+TMP_MNT=$(mktemp -d /root/mnt_dd.XXXX)
+
+# 任何情況下（包括 die/Ctrl+C）都確保清理掛載點和 loop 裝置
+cleanup_mount() {
+    umount "$TMP_MNT/proc" "$TMP_MNT/sys" "$TMP_MNT/dev" 2>/dev/null || true
+    umount "$TMP_MNT" 2>/dev/null || true
+    rmdir  "$TMP_MNT"  2>/dev/null || true
+    [[ -n "$LOOP" ]] && losetup -d "$LOOP" 2>/dev/null || true
+}
+trap cleanup_mount EXIT
+
 info "  loop 裝置: $LOOP"
 sleep 1  # 等核心建立分區裝置節點
 
@@ -130,49 +143,165 @@ for candidate in "${LOOP}p1" "${LOOP}p2" "$LOOP"; do
     fi
 done
 if [[ -z "$ROOT_PART" ]]; then
-    losetup -d "$LOOP"
     die "找不到根分區，請確認鏡像格式"
 fi
 info "  根分區: $ROOT_PART"
 
-TMP_MNT=$(mktemp -d /root/mnt_dd.XXXX)
-mount "$ROOT_PART" "$TMP_MNT" || { losetup -d "$LOOP"; die "掛載根分區失敗"; }
+mount "$ROOT_PART" "$TMP_MNT" || die "掛載根分區失敗"
 
-# 設 root 密碼
-echo "root:${PASSWORD}" | chroot "$TMP_MNT" chpasswd \
-    && success "  root 密碼設定完成" \
-    || warn "  chpasswd 失敗（跨架構 chroot 限制，繼續）"
+# 在 host 直接生成 SHA-512 hash，寫入 shadow（不依賴 chroot chpasswd）
+info "  生成密碼 hash..."
+if command -v openssl >/dev/null && openssl passwd --help 2>&1 | grep -q '\-6'; then
+    PASS_HASH=$(openssl passwd -6 "$PASSWORD")
+elif command -v python3 >/dev/null; then
+    PASS_HASH=$(python3 -c "import crypt,sys; print(crypt.crypt(sys.argv[1], crypt.mksalt(crypt.METHOD_SHA512)))" "$PASSWORD")
+else
+    die "找不到 openssl -6 或 python3 來生成密碼 hash"
+fi
+
+SHADOW="$TMP_MNT/etc/shadow"
+if [[ -f "$SHADOW" ]]; then
+    # 替換 root 的密碼欄位（第2欄）
+    sed -i "s|^root:[^:]*:|root:${PASS_HASH}:|" "$SHADOW"
+    # 確認有 root 行（萬一沒有就新增）
+    grep -q "^root:" "$SHADOW" || echo "root:${PASS_HASH}:0:0:99999:7:::" >> "$SHADOW"
+    # 解鎖 root（移除前面的 ! 或 *）
+    sed -i 's|^root:!|root:|; s|^root:\*|root:|' "$SHADOW"
+    success "  /etc/shadow root 密碼直寫完成"
+else
+    warn "  找不到 /etc/shadow"
+fi
 
 # 啟用 SSH root 登入 + 密碼認證
 SSH_CFG="$TMP_MNT/etc/ssh/sshd_config"
 if [[ -f "$SSH_CFG" ]]; then
     sed -i 's/^#*\s*PermitRootLogin.*/PermitRootLogin yes/'            "$SSH_CFG"
     sed -i 's/^#*\s*PasswordAuthentication.*/PasswordAuthentication yes/' "$SSH_CFG"
+    # 確保這兩行存在（有些 sshd_config 可能沒有這些行）
+    grep -q "^PermitRootLogin"      "$SSH_CFG" || echo "PermitRootLogin yes"      >> "$SSH_CFG"
+    grep -q "^PasswordAuthentication" "$SSH_CFG" || echo "PasswordAuthentication yes" >> "$SSH_CFG"
     success "  sshd_config 修改完成"
 else
     warn "  找不到 sshd_config，跳過"
 fi
 
-# 阻止 cloud-init 覆蓋 SSH 設定和密碼
+# 完全停用 cloud-init（最可靠，防止它重設密碼/SSH/亂改設定）
+touch "$TMP_MNT/etc/cloud/cloud-init.disabled"
+success "  cloud-init 已停用"
+
+# 補網路設定（cloud-init 停用後靠 /etc/network/interfaces 起網路）
+info "注入網路設定..."
+NET_IFACE_CFG="$TMP_MNT/etc/network/interfaces"
+if [[ -f "$NET_IFACE_CFG" ]] && grep -q "dhcp" "$NET_IFACE_CFG"; then
+    success "  /etc/network/interfaces 已有 DHCP 設定"
+else
+    cat > "$NET_IFACE_CFG" << 'NETEOF'
+source /etc/network/interfaces.d/*
+
+auto lo
+iface lo inet loopback
+
+auto eth0
+iface eth0 inet dhcp
+
+auto ens3
+iface ens3 inet dhcp
+
+auto ens5
+iface ens5 inet dhcp
+
+auto enp1s0
+iface enp1s0 inet dhcp
+NETEOF
+    success "  /etc/network/interfaces 建立完成"
+fi
+
+# 預生成 SSH host keys（防止新系統第一次起動時 sshd 因找不到 hostkey 而失敗）
+info "預生成 SSH host keys..."
+SSHD_DIR="$TMP_MNT/etc/ssh"
+mkdir -p "$SSHD_DIR"
+for keytype in rsa ecdsa ed25519; do
+    keyfile="$SSHD_DIR/ssh_host_${keytype}_key"
+    if [[ ! -f "$keyfile" ]]; then
+        ssh-keygen -q -t "$keytype" -N "" -f "$keyfile" 2>/dev/null \
+            && success "  生成 ssh_host_${keytype}_key" \
+            || warn "  生成 ${keytype} key 失敗（跳過）"
+    fi
+done
+
+# 保留 cloud.cfg 修改作為雙重保障
 mkdir -p "$TMP_MNT/etc/cloud/cloud.cfg.d"
 printf 'ssh_pwauth: true\ndisable_root: false\n' \
     > "$TMP_MNT/etc/cloud/cloud.cfg.d/99_dd.cfg"
 
-# 直接改 cloud.cfg（99_dd.cfg 有時優先級不夠）
 CLOUD_CFG="$TMP_MNT/etc/cloud/cloud.cfg"
 if [[ -f "$CLOUD_CFG" ]]; then
     sed -i 's/disable_root:\s*true/disable_root: false/'   "$CLOUD_CFG"
     sed -i 's/ssh_pwauth:\s*false/ssh_pwauth: true/'       "$CLOUD_CFG"
     sed -i 's/ssh_pwauth:\s*0/ssh_pwauth: true/'           "$CLOUD_CFG"
-    # 移除 set-passwords 模組，防止 cloud-init 重設密碼
     sed -i '/^\s*-\s*set-passwords/d'                      "$CLOUD_CFG"
-    success "  cloud.cfg 修改完成"
-else
-    warn "  找不到 cloud.cfg"
 fi
 
-umount "$TMP_MNT" && rmdir "$TMP_MNT"
-losetup -d "$LOOP"
+# ── SSH host keys 預生成（cloud image 通常沒有，sshd 起不來）──────────────────
+info "預生成 SSH host keys..."
+for keytype in rsa ecdsa ed25519; do
+    keyfile="$TMP_MNT/etc/ssh/ssh_host_${keytype}_key"
+    if [[ ! -f "$keyfile" ]]; then
+        ssh-keygen -t "$keytype" -N "" -f "$keyfile" -q \
+            && success "  生成 ${keytype} host key" \
+            || warn "  生成 ${keytype} key 失敗"
+    fi
+done
+
+# ── apt 換騰訊雲鏡像源 ────────────────────────────────────────────────────────
+info "設定騰訊雲 apt 鏡像源..."
+# 偵測 codename（從 /etc/os-release 或 /etc/debian_version）
+CODENAME=""
+if [[ -f "$TMP_MNT/etc/os-release" ]]; then
+    CODENAME=$(grep "^VERSION_CODENAME=" "$TMP_MNT/etc/os-release" | cut -d= -f2 | tr -d '"')
+fi
+[[ -z "$CODENAME" ]] && CODENAME="bookworm"  # fallback
+
+info "  偵測到 codename: $CODENAME"
+
+case "$DISTRO" in
+    debian)
+        cat > "$TMP_MNT/etc/apt/sources.list" << APTEOF
+deb https://mirrors.cloud.tencent.com/debian/ ${CODENAME} main contrib non-free non-free-firmware
+deb https://mirrors.cloud.tencent.com/debian/ ${CODENAME}-updates main contrib non-free non-free-firmware
+deb https://mirrors.cloud.tencent.com/debian-security ${CODENAME}-security main contrib non-free non-free-firmware
+APTEOF
+        # 清掉可能存在的 sources.list.d（cloud image 有時會放額外 sources）
+        rm -f "$TMP_MNT/etc/apt/sources.list.d/debian.sources" 2>/dev/null || true
+        success "  apt 已換為騰訊雲 Debian 源 ($CODENAME)"
+        ;;
+    ubuntu)
+        cat > "$TMP_MNT/etc/apt/sources.list" << APTEOF
+deb https://mirrors.cloud.tencent.com/ubuntu/ ${CODENAME} main restricted universe multiverse
+deb https://mirrors.cloud.tencent.com/ubuntu/ ${CODENAME}-updates main restricted universe multiverse
+deb https://mirrors.cloud.tencent.com/ubuntu/ ${CODENAME}-backports main restricted universe multiverse
+deb https://mirrors.cloud.tencent.com/ubuntu/ ${CODENAME}-security main restricted universe multiverse
+APTEOF
+        success "  apt 已換為騰訊雲 Ubuntu 源 ($CODENAME)"
+        ;;
+esac
+
+# ── 預裝 ifupdown + isc-dhcp-client（cloud image 通常沒有）────────────────────
+info "預裝 ifupdown + dhclient..."
+mount --bind /proc    "$TMP_MNT/proc"
+mount --bind /sys     "$TMP_MNT/sys"
+mount --bind /dev     "$TMP_MNT/dev"
+mount --bind /dev/pts "$TMP_MNT/dev/pts" 2>/dev/null || true
+rm -f "$TMP_MNT/etc/resolv.conf"
+cp /etc/resolv.conf "$TMP_MNT/etc/resolv.conf"
+
+chroot "$TMP_MNT" apt-get update -qq \
+    && chroot "$TMP_MNT" apt-get install -y -q ifupdown isc-dhcp-client \
+    && success "  ifupdown + dhclient 安裝完成" \
+    || warn "  apt-get 失敗，開機後手動執行: apt install ifupdown isc-dhcp-client"
+
+trap - EXIT   # 清除 trap，統一由下面 cleanup_mount 處理
+cleanup_mount
 success "密碼和 SSH 配置注入完成"
 
 # ─── 壓縮 ────────────────────────────────────────────────────────────────────
@@ -185,6 +314,8 @@ else
     xz -T0 -z --keep "$RAW_PATH" \
         || die "xz 壓縮失敗（磁碟空間不足？）"
     mv "${RAW_PATH}.xz" "$XZ_PATH"
+    # 壓縮完立刻刪 raw，節省空間
+    rm -f "$RAW_PATH"
 fi
 success "壓縮完成 ($(du -sh "$XZ_PATH" | cut -f1))"
 
