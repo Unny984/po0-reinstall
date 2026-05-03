@@ -178,12 +178,23 @@ SSH_CFG="$TMP_MNT/etc/ssh/sshd_config"
 if [[ -f "$SSH_CFG" ]]; then
     sed -i 's/^#*\s*PermitRootLogin.*/PermitRootLogin yes/'            "$SSH_CFG"
     sed -i 's/^#*\s*PasswordAuthentication.*/PasswordAuthentication yes/' "$SSH_CFG"
-    # 確保這兩行存在（有些 sshd_config 可能沒有這些行）
-    grep -q "^PermitRootLogin"      "$SSH_CFG" || echo "PermitRootLogin yes"      >> "$SSH_CFG"
+    grep -q "^PermitRootLogin"        "$SSH_CFG" || echo "PermitRootLogin yes"      >> "$SSH_CFG"
     grep -q "^PasswordAuthentication" "$SSH_CFG" || echo "PasswordAuthentication yes" >> "$SSH_CFG"
     success "  sshd_config 修改完成"
-else
-    warn "  找不到 sshd_config，跳過"
+fi
+
+# 處理 sshd_config.d/ 下的覆蓋檔（Ubuntu cloud image 有 60-cloudimg-settings.conf）
+SSHD_CONF_D="$TMP_MNT/etc/ssh/sshd_config.d"
+if [[ -d "$SSHD_CONF_D" ]]; then
+    for f in "$SSHD_CONF_D"/*.conf; do
+        [[ -f "$f" ]] || continue
+        sed -i 's/^#*\s*PasswordAuthentication.*/PasswordAuthentication yes/' "$f"
+        sed -i 's/^#*\s*PermitRootLogin.*/PermitRootLogin yes/'               "$f"
+    done
+    # 加一個最高優先級覆蓋檔確保設定生效
+    printf 'PermitRootLogin yes\nPasswordAuthentication yes\n' \
+        > "$SSHD_CONF_D/99-reinstall.conf"
+    success "  sshd_config.d 處理完成"
 fi
 
 # 完全停用 cloud-init（最可靠，防止它重設密碼/SSH/亂改設定）
