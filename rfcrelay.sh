@@ -120,17 +120,20 @@ success "raw 轉換完成 ($(du -sh "$RAW_PATH" | cut -f1))"
 
 # ─── loop mount：預設 root 密碼 + SSH ───────────────────────────────────────
 info "注入 root 密碼 + 啟用 SSH 密碼登入（loop mount）..."
+
+# 先初始化變數、設 trap，確保任何情況下都會清理
+LOOP=""
+TMP_MNT=""
+cleanup_mount() {
+    [[ -n "$TMP_MNT" ]] && umount "$TMP_MNT/proc" "$TMP_MNT/sys" "$TMP_MNT/dev" 2>/dev/null || true
+    [[ -n "$TMP_MNT" ]] && umount "$TMP_MNT" 2>/dev/null || true
+    [[ -n "$TMP_MNT" ]] && rmdir  "$TMP_MNT"  2>/dev/null || true
+    [[ -n "$LOOP"    ]] && losetup -d "$LOOP"  2>/dev/null || true
+}
+trap cleanup_mount EXIT INT TERM
+
 LOOP=$(losetup -f --show -P "$RAW_PATH") || die "losetup 失敗"
 TMP_MNT=$(mktemp -d /root/mnt_dd.XXXX)
-
-# 任何情況下（包括 die/Ctrl+C）都確保清理掛載點和 loop 裝置
-cleanup_mount() {
-    umount "$TMP_MNT/proc" "$TMP_MNT/sys" "$TMP_MNT/dev" 2>/dev/null || true
-    umount "$TMP_MNT" 2>/dev/null || true
-    rmdir  "$TMP_MNT"  2>/dev/null || true
-    [[ -n "$LOOP" ]] && losetup -d "$LOOP" 2>/dev/null || true
-}
-trap cleanup_mount EXIT
 
 info "  loop 裝置: $LOOP"
 sleep 1  # 等核心建立分區裝置節點
