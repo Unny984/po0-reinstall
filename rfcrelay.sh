@@ -235,6 +235,51 @@ NETEOF
     success "  /etc/network/interfaces 建立完成"
 fi
 
+# 注入首次開機自動擴容腳本（DD 後分區只有 cloud image 大小，需擴到磁碟實際大小）
+info "注入自動擴容腳本..."
+cat > "$TMP_MNT/etc/rc.local" << 'RCEOF'
+#!/bin/bash
+# 首次開機自動擴容 - 執行一次後自我刪除
+MARKER="/etc/.disk-expanded"
+if [[ ! -f "$MARKER" ]]; then
+    ROOT_DEV=$(findmnt -n -o SOURCE / 2>/dev/null || cat /proc/mounts | awk '$2=="/" {print $1}')
+    if [[ "$ROOT_DEV" =~ nvme ]]; then
+        DISK=$(echo "$ROOT_DEV" | sed 's/p[0-9]*$//')
+        PART_NUM=$(echo "$ROOT_DEV" | grep -oE '[0-9]+$')
+    else
+        DISK=$(echo "$ROOT_DEV" | sed 's/[0-9]*$//')
+        PART_NUM=$(echo "$ROOT_DEV" | grep -oE '[0-9]+$')
+    fi
+    growpart "$DISK" "$PART_NUM" 2>&1 | logger -t rc.local
+    resize2fs "$ROOT_DEV"        2>&1 | logger -t rc.local
+    touch "$MARKER"
+    logger -t rc.local "disk expand done: $ROOT_DEV"
+fi
+exit 0
+RCEOF
+chmod +x "$TMP_MNT/etc/rc.local"
+# 確保 rc-local.service 啟用（Debian/Ubuntu 預設不啟用）
+RC_LOCAL_SVC="$TMP_MNT/etc/systemd/system/rc-local.service"
+if [[ ! -f "$RC_LOCAL_SVC" ]]; then
+    cat > "$RC_LOCAL_SVC" << 'SVCEOF'
+[Unit]
+Description=Run /etc/rc.local on first boot
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/etc/rc.local
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+fi
+mkdir -p "$TMP_MNT/etc/systemd/system/multi-user.target.wants"
+ln -sf /etc/systemd/system/rc-local.service \
+    "$TMP_MNT/etc/systemd/system/multi-user.target.wants/rc-local.service" 2>/dev/null || true
+success "  自動擴容腳本注入完成（首次開機執行，之後自動停用）"
+
 # 預生成 SSH host keys（防止新系統第一次起動時 sshd 因找不到 hostkey 而失敗）
 info "預生成 SSH host keys..."
 SSHD_DIR="$TMP_MNT/etc/ssh"
