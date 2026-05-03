@@ -55,6 +55,7 @@ WORK_DIR="/root/dd-work"     # [FIX1] 用 /root，不用 /tmp
 SERVE_DIR="/srv/mini-reinstall"
 ALPINE_DIR="$SERVE_DIR/alpine"
 IMAGES_DIR="$SERVE_DIR/images"
+GITHUB_RAW="https://raw.githubusercontent.com/Unny984/po0-reinstall/refs/heads/main"
 
 # ─── 安裝依賴 ────────────────────────────────────────────────────────────────
 info "安裝依賴套件..."
@@ -324,6 +325,13 @@ info "清理暫時文件..."
 rm -f "$RAW_PATH" "$IMG_PATH"
 rmdir "$WORK_DIR" 2>/dev/null || true
 
+# ─── 下載 po0reinstall.sh 供目標機器使用 ────────────────────────────────────
+info "下載 po0reinstall.sh..."
+wget -q "$GITHUB_RAW/po0reinstall.sh" -O "$SERVE_DIR/po0reinstall.sh" \
+    && chmod +x "$SERVE_DIR/po0reinstall.sh" \
+    && success "po0reinstall.sh 就緒" \
+    || warn "下載 po0reinstall.sh 失敗，目標機器需手動下載"
+
 # ─── 顯示文件清單 ─────────────────────────────────────────────────────────────
 echo ""
 echo -e "${GREEN}═══════════════════════════════════════════════${NC}"
@@ -337,8 +345,12 @@ echo ""
 
 # 取得本機 IP
 MY_IP=$(ip -4 route get 8.8.8.8 2>/dev/null | awk '/src/{print $7}' | head -1)
-echo -e "${CYAN}在目標機器上執行：${NC}"
-echo -e "  ${YELLOW}./po0reinstall.sh -ip \"${MY_IP:-<中轉機IP>}\" [-distro $DISTRO]${NC}"
+MY_IP="${MY_IP:-<中轉機IP>}"
+
+echo -e "${GREEN}══════════════════════════════════════════════════════════════${NC}"
+echo -e "${GREEN} 在目標機器 (po0) 上執行以下一行指令：${NC}"
+echo -e "${GREEN}══════════════════════════════════════════════════════════════${NC}"
+echo -e "  ${YELLOW}bash <(curl -s http://${MY_IP}:${HTTP_PORT}/po0reinstall.sh) -ip \"${MY_IP}\"${NC}"
 echo ""
 echo -e "${CYAN}HTTP 服務器啟動中 (port $HTTP_PORT)，按 Ctrl+C 停止...${NC}"
 echo ""
